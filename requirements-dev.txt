@@ -1,0 +1,5 @@
+# Dépendances pour le développement et les tests
+pytest==8.0.0
+pytest-mock==3.12.0
+requests-mock==1.11.0
+freezegun==1.4.0

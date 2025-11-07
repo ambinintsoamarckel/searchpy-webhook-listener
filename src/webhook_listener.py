@@ -1,11 +1,36 @@
 import os
 import time
 import json
-import hmac
 import subprocess
 import requests
+import logging
+import colorlog
 from flask import Flask, request
 from pathlib import Path
+import hmac
+
+# --- Logger Setup ---
+def setup_logger():
+    """Configure un logger coloré."""
+    logger = logging.getLogger(__name__)
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        handler = colorlog.StreamHandler()
+        formatter = colorlog.ColoredFormatter(
+            '%(log_color)s%(levelname)-8s%(reset)s %(blue)s%(message)s',
+            log_colors={
+                'DEBUG':    'cyan',
+                'INFO':     'green',
+                'WARNING':  'yellow',
+                'ERROR':    'red',
+                'CRITICAL': 'red,bg_white',
+            }
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+logger = setup_logger()
 
 # --- Configuration ---
 CRITICAL_SERVICE_NAME = os.environ.get("CRITICAL_SERVICE_NAME", "searchpy-app-prod")
@@ -19,6 +44,10 @@ RECOVERY_SCRIPT_PATH = "/usr/src/app/critical_recovery.sh"
 COOLDOWN_PERIOD = int(os.environ.get("COOLDOWN_PERIOD", 300))  # 5 min par défaut
 
 app = Flask(__name__)
+# Désactiver les logs de Flask pour ne garder que les nôtres
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.setLevel(logging.ERROR)
+
 
 # --- Persistence Layer ---
 
@@ -36,8 +65,12 @@ class StateManager:
             try:
                 with open(self.state_file, 'r') as f:
                     return json.load(f)
+            except FileNotFoundError:
+                logger.warning(f"Fichier d'état non trouvé: {self.state_file}, création d'un nouveau.")
             except json.JSONDecodeError:
-                print("⚠️ État corrompu, réinitialisation")
+                logger.warning("État corrompu, réinitialisation")
+            except IOError as e:
+                logger.error(f"Erreur de lecture du fichier d'état: {e}, réinitialisation.")
         return {
             "fail_count": {},
             "last_attempt_time": {},
@@ -51,14 +84,15 @@ class StateManager:
             with open(self.state_file, 'w') as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
-            print(f"❌ Erreur sauvegarde état: {e}")
+            logger.error(f"Erreur sauvegarde état: {e}")
 
     def increment_fail_count(self, service_name):
         """Incrémente le compteur d'échecs"""
-        self.state["fail_count"][service_name] = self.state["fail_count"].get(service_name, 0) + 1
+        current_count = self.state["fail_count"].get(service_name, 0) + 1
+        self.state["fail_count"][service_name] = current_count
         self.state["last_attempt_time"][service_name] = time.time()
         self.save_state()
-        return self.state["fail_count"][service_name]
+        return current_count
 
     def reset_fail_count(self, service_name):
         """Réinitialise le compteur"""
@@ -87,39 +121,25 @@ class StateManager:
 
 state_manager = StateManager(STATE_FILE)
 
+# --- Constantes d'Alerte ---
+COLORS = {"info": 3447003, "warning": 16776960, "critical": 15158332, "FINAL_STOP": 15158332}
+EMOJIS = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨", "FINAL_STOP": "🔴"}
+
 # --- Fonctions d'Alerte ---
 
 def send_discord_alert(webhook_url, message, level="info"):
     """Envoie une notification Discord avec embed formaté"""
     if not webhook_url:
-        print(f"⚠️ Alerte {level} non envoyée: URL manquante")
+        logger.warning(f"Alerte {level} non envoyée: URL manquante")
         return
-
-    # Couleurs selon le niveau
-    colors = {
-        "info": 3447003,      # Bleu
-        "warning": 16776960,  # Jaune
-        "critical": 15158332, # Orange
-        "FINAL_STOP": 15158332  # Rouge
-    }
-
-    # Émojis selon le niveau
-    emojis = {
-        "info": "ℹ️",
-        "warning": "⚠️",
-        "critical": "🚨",
-        "FINAL_STOP": "🔴"
-    }
 
     payload = {
         "embeds": [{
-            "title": f"{emojis.get(level, '📢')} Alerte Monitoring - {level.upper()}",
+            "title": f"{EMOJIS.get(level, '📢')} Alerte Monitoring - {level.upper()}",
             "description": message,
-            "color": colors.get(level, 3447003),
+            "color": COLORS.get(level, 3447003),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "footer": {
-                "text": f"SearchPy Monitoring System - VPS {os.environ.get('HOSTNAME', 'Unknown')}"
-            }
+            "footer": {"text": f"SearchPy Monitoring System - VPS {os.environ.get('HOSTNAME', 'Unknown')}"}
         }],
         "username": "SearchPy Watchdog"
     }
@@ -127,55 +147,48 @@ def send_discord_alert(webhook_url, message, level="info"):
     try:
         response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
-        print(f"✅ Alerte Discord envoyée ({level})")
+        logger.info(f"Alerte Discord envoyée ({level})")
     except requests.exceptions.RequestException as e:
-        print(f"❌ Erreur envoi Discord: {e}")
+        logger.error(f"Erreur envoi Discord: {e}")
 
 # --- Fonctions Docker ---
 
 def run_docker_compose_command(command, compose_file):
     """Exécute une commande docker compose"""
     full_command = f"docker compose -f {compose_file} {command}"
-    print(f"🐳 Exécution: {full_command}")
+    logger.info(f"🐳 Exécution: {full_command}")
     try:
         result = subprocess.run(
-            full_command,
-            shell=True,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120  # Timeout de 2 minutes
+            full_command, shell=True, check=True, capture_output=True, text=True, timeout=120
         )
-        print(f"✅ Commande réussie: {result.stdout}")
+        logger.info(f"Commande réussie: {result.stdout.strip()}")
         return True
     except subprocess.TimeoutExpired:
-        print(f"⏱️ Timeout lors de l'exécution Docker Compose")
+        logger.error("Timeout lors de l'exécution Docker Compose")
         return False
     except subprocess.CalledProcessError as e:
-        print(f"❌ Erreur Docker Compose: {e.stderr}")
+        logger.error(f"Erreur Docker Compose: {e.stderr.strip()}")
         return False
     except Exception as e:
-        print(f"❌ Erreur inconnue: {e}")
+        logger.error(f"Erreur inconnue: {e}")
         return False
 
 def run_critical_recovery_script(service_name, attempt_count):
     """Exécute le script de sauvegarde des logs"""
-    print(f"📦 Exécution du script de remédiation: {RECOVERY_SCRIPT_PATH}")
+    logger.info(f"📦 Exécution du script de remédiation: {RECOVERY_SCRIPT_PATH}")
     try:
         result = subprocess.run(
             [RECOVERY_SCRIPT_PATH, service_name, str(attempt_count)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60
+            check=True, capture_output=True, text=True, timeout=60
         )
-        print(f"✅ Script de remédiation réussi: {result.stdout}")
+        logger.info(f"Script de remédiation réussi:
+{result.stdout.strip()}")
         return True
     except subprocess.TimeoutExpired:
-        print(f"⏱️ Timeout du script de remédiation")
+        logger.error("Timeout du script de remédiation")
         return False
     except subprocess.CalledProcessError as e:
-        print(f"❌ Erreur script: {e.stderr}")
+        logger.error(f"Erreur script: {e.stderr.strip()}")
         return False
 
 # --- Authentification ---
@@ -183,7 +196,7 @@ def run_critical_recovery_script(service_name, attempt_count):
 def verify_webhook_token():
     """Vérifie le token d'authentification du webhook"""
     if not WEBHOOK_SECRET:
-        print("⚠️ WEBHOOK_SECRET non défini, mode développement")
+        logger.warning("WEBHOOK_SECRET non défini, authentification désactivée (mode développement)")
         return True
 
     auth_header = request.headers.get('X-Webhook-Token')
@@ -207,10 +220,8 @@ def health_check():
 @app.route('/autoheal-event', methods=['POST'])
 def handle_autoheal_event():
     """Gère les événements de santé du service critique"""
-
-    # Authentification
     if not verify_webhook_token():
-        print("🔒 Tentative d'accès non autorisée")
+        logger.warning("Tentative d'accès non autorisée (token invalide/manquant)")
         return {"error": "Unauthorized"}, 401
 
     data = request.json
@@ -220,25 +231,21 @@ def handle_autoheal_event():
     service_name = data.get('container_name')
     event_type = data.get('type', 'restart_attempt')
 
-    # Filtrage du service
     if not service_name or service_name != CRITICAL_SERVICE_NAME:
         return {"status": "ignored", "reason": "not_critical_service"}, 200
 
     if event_type != 'restart_attempt':
         return {"status": "ignored", "reason": "not_restart_event"}, 200
 
-    # Cooldown check
     if state_manager.is_in_cooldown(service_name):
-        print(f"⏳ Service {service_name} en cooldown, événement ignoré")
+        logger.info(f"Service {service_name} en cooldown, événement ignoré")
         return {"status": "cooldown"}, 200
 
-    # Incrément du compteur
     current_count = state_manager.increment_fail_count(service_name)
-    print(f"📊 {service_name}: {current_count}/{CRITICAL_FAIL_COUNT} échecs")
+    logger.info(f"Échec détecté pour '{service_name}'. Total: {current_count}/{CRITICAL_FAIL_COUNT}")
 
-    # Seuil atteint ?
     if current_count >= CRITICAL_FAIL_COUNT and not state_manager.is_recovery_triggered(service_name):
-
+        logger.warning(f"Seuil critique atteint pour '{service_name}'. Démarrage de la remédiation.")
         send_discord_alert(
             WEBHOOK_URL_CRITICAL,
             f"**Service**: `{service_name}`\n"
@@ -248,46 +255,36 @@ def handle_autoheal_event():
             f"- Redémarrage complet de la stack",
             level="critical"
         )
-
         state_manager.mark_recovery_triggered(service_name)
 
-        # 1. Sauvegarde des logs
         if not run_critical_recovery_script(service_name, current_count):
             send_discord_alert(
                 WEBHOOK_URL_FINAL,
                 f"**🚨 ÉCHEC CRITIQUE 🚨**\n\n"
                 f"**Service**: `{service_name}`\n"
                 f"**Problème**: Échec de la sauvegarde des logs\n"
-                f"**Action requise**: Intervention manuelle immédiate\n\n"
-                f"Vérifiez les permissions et l'espace disque.",
+                f"**Action requise**: Intervention manuelle immédiate.",
                 level="FINAL_STOP"
             )
             return {"status": "error", "message": "Log backup failed"}, 500
 
-        # 2. Redémarrage complet
         if run_docker_compose_command("down", COMPOSE_FILE_PATH):
-            time.sleep(5)  # Pause pour s'assurer que tout est bien arrêté
-
+            time.sleep(5)
             if run_docker_compose_command("up -d", COMPOSE_FILE_PATH):
+                logger.info("Stack relancée avec succès, attente du prochain healthcheck.")
                 state_manager.reset_fail_count(service_name)
-                print("✅ Stack relancée avec succès, attente healthcheck...")
                 return {"status": "recovery_success"}, 200
 
-        # 3. Échec de la remédiation
+        logger.critical(f"La remédiation automatique a échoué pour '{service_name}'. Intervention manuelle requise.")
         send_discord_alert(
             WEBHOOK_URL_FINAL,
             f"**🔴 ARRÊT FINAL - INTERVENTION REQUISE 🔴**\n\n"
             f"**Service**: `{service_name}`\n"
-            f"**Tentatives échouées**: {current_count}\n"
-            f"**Problème**: La remédiation automatique a échoué\n\n"
-            f"**Actions à effectuer**:\n"
-            f"1. Vérifier les logs système\n"
-            f"2. Analyser l'état Docker\n"
-            f"3. Relancer manuellement si nécessaire\n\n"
+            f"**Problème**: La remédiation automatique (docker compose down/up) a échoué.\n\n"
             f"@everyone - Panne critique détectée",
             level="FINAL_STOP"
         )
-        return {"status": "error", "message": "Recovery failed"}, 500
+        return {"status": "error", "message": "Full recovery failed"}, 500
 
     return {"status": "counted", "current": current_count, "threshold": CRITICAL_FAIL_COUNT}, 200
 
@@ -295,11 +292,12 @@ def handle_autoheal_event():
 def reset_state():
     """Endpoint pour réinitialiser l'état (admin only)"""
     if not verify_webhook_token():
+        logger.warning("Tentative d'accès non autorisée sur /reset")
         return {"error": "Unauthorized"}, 401
 
     service_name = request.json.get('service_name', CRITICAL_SERVICE_NAME)
     state_manager.reset_fail_count(service_name)
-
+    logger.info(f"État réinitialisé manuellement pour le service '{service_name}'")
     return {"status": "reset", "service": service_name}, 200
 
 @app.route('/status', methods=['GET'])
@@ -313,10 +311,9 @@ def get_status():
     }, 200
 
 if __name__ == '__main__':
-    print("🚀 Démarrage du Webhook Listener Sécurisé")
-    print(f"📌 Service critique: {CRITICAL_SERVICE_NAME}")
-    print(f"📊 Seuil: {CRITICAL_FAIL_COUNT} tentatives")
-    print(f"⏱️ Cooldown: {COOLDOWN_PERIOD}s")
-    print(f"🔒 Authentification: {'Activée' if WEBHOOK_SECRET else 'DÉSACTIVÉE (DEV ONLY)'}")
-
+    logger.info("🚀 Démarrage du Webhook Listener Sécurisé")
+    logger.info(f"Service critique à surveiller: {CRITICAL_SERVICE_NAME}")
+    logger.info(f"Seuil d'échecs avant action: {CRITICAL_FAIL_COUNT}")
+    logger.info(f"Période de cooldown: {COOLDOWN_PERIOD}s")
+    logger.info(f"Authentification: {'Activée' if WEBHOOK_SECRET else 'DÉSACTIVÉE (MODE DÉVELOPPEMENT)'}")
     app.run(host='0.0.0.0', port=5000)

@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+.github/
+
+# Documentation
+README.md
+CHANGELOG.md
+LICENSE
+docs/
+
+# Examples
+examples/
+
+# Development
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Environment
+.env
+.env.*
+!.env.example

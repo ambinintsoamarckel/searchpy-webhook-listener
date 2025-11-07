@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Docker
+.dockerignore
+
+# Environment
+.env
+.env.local
+*.env
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# State
+webhook_state/
+state/
+
+# Backups
+*.tar.gz
+backups/

@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ========================================
 # WATCHDOG SPÉCIFIQUE À SEARCHPY
 # Utilise l'image depuis Docker Hub / GitHub Registry
