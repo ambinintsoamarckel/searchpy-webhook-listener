@@ -1,0 +1,110 @@
+version: '3.8'
+
+# ========================================
+# WATCHDOG SPÉCIFIQUE À SEARCHPY
+# Utilise l'image depuis Docker Hub / GitHub Registry
+# Plus besoin de builder localement !
+# ========================================
+
+services:
+  # Redémarreur automatique avec support webhook
+  autoheal:
+    image: monim1/autoheal:latest
+    container_name: searchpy-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: all
+      AUTOHEAL_INTERVAL: 5
+      AUTOHEAL_START_PERIOD: 0
+      # Webhook vers le listener
+      WEBHOOK_URL: "http://searchpy-webhook-listener:5000/autoheal-event"
+      WEBHOOK_HEADERS: "X-Webhook-Token: ${WEBHOOK_SECRET}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - search_api_network
+      - watchdog_internal
+    depends_on:
+      webhook-listener:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+  # Cerveau de la remédiation critique
+  # ⚠️ CHANGEMENT: Utilise l'image au lieu de build
+  webhook-listener:
+    # Remplacer 'votre-user' par votre nom d'utilisateur Docker Hub
+    # ou 'ghcr.io/votre-user' pour GitHub Container Registry
+    image: votre-user/searchpy-webhook-listener:latest
+
+    # Alternative: utiliser un tag de version spécifique (RECOMMANDÉ en production)
+    # image: votre-user/searchpy-webhook-listener:1.0.0
+
+    # Pour développement local uniquement, décommenter build:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+
+    container_name: searchpy-webhook-listener
+    restart: always
+    ports:
+      - "5000:5000"
+    volumes:
+      # Socket Docker pour contrôle de la stack
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # ⚠️ IMPORTANT: critical_recovery.sh est maintenant DANS l'image
+      # Plus besoin de monter le script !
+      # SUPPRIMÉ: - ./critical_recovery.sh:/usr/src/app/critical_recovery.sh:ro
+
+      # Dossier logs de l'application
+      - ./logs:/usr/src/app/logs_host
+
+      # Répertoire de sauvegarde hôte
+      - /var/backups/searchpy_logs:/usr/src/app/backups_mount
+
+      # Fichier docker-compose de l'app (READ-ONLY)
+      - ./docker-compose.yml:/host/docker-compose.yml:ro
+
+      # Persistance de l'état (VOLUME NOMMÉ)
+      - webhook_state:/usr/src/app/state
+
+    environment:
+      CRITICAL_SERVICE_NAME: "searchpy-app-prod"
+      CRITICAL_FAIL_COUNT: 3
+      COMPOSE_FILE_PATH: "/host/docker-compose.yml"
+      WEBHOOK_URL_CRITICAL: "${WEBHOOK_URL_CRITICAL}"
+      WEBHOOK_URL_FINAL: "${WEBHOOK_URL_FINAL}"
+      WEBHOOK_SECRET: "${WEBHOOK_SECRET}"
+      COOLDOWN_PERIOD: "300"
+      HOSTNAME: "${HOSTNAME:-VPS-SEARCHPY-PROD}"
+    networks:
+      - search_api_network
+      - watchdog_internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          memory: 128M
+
+volumes:
+  webhook_state:
+    name: searchpy_webhook_state
+
+networks:
+  watchdog_internal:
+    name: searchpy_watchdog
+    driver: bridge
+  search_api_network:
+    external: true

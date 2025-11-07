@@ -1,0 +1,91 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags:
+      - 'v*.*.*'  # Déclenche sur les tags de version (v1.0.0, v1.2.3, etc.)
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Permet de lancer manuellement
+
+env:
+  # Changer selon votre registry
+  REGISTRY: docker.io  # Pour Docker Hub
+  # REGISTRY: ghcr.io  # Pour GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository_owner }}/searchpy-webhook-listener
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # Nécessaire pour ghcr.io
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}  # À configurer dans GitHub Secrets
+          password: ${{ secrets.DOCKER_PASSWORD }}  # À configurer dans GitHub Secrets
+
+      # Alternative pour GitHub Container Registry
+      # - name: 🔐 Log in to GitHub Container Registry
+      #   if: github.event_name != 'pull_request'
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏷️ Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag avec le SHA du commit
+            type=sha,prefix={{branch}}-
+            # Tag 'latest' sur main
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag avec le nom de la branche
+            type=ref,event=branch
+            # Tag sémantique depuis les tags Git
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: 🏗️ Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64  # Support multi-architecture
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha  # Utilise le cache GitHub Actions
+          cache-to: type=gha,mode=max
+
+      - name: 📊 Image digest
+        run: echo ${{ steps.meta.outputs.digest }}
+
+      - name: 🎉 Build summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### 🐳 Docker Image Published! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

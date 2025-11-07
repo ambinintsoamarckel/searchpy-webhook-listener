@@ -1,0 +1,15 @@
+# Dépendances Python pour Webhook Listener
+# Version: 2.0
+
+# Framework web
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# HTTP client pour webhooks Discord
+requests==2.31.0
+
+# Optionnel: pour un meilleur logging
+# colorlog==6.8.0
+
+# Optionnel: pour monitoring avancé
+# prometheus-client==0.19.0
