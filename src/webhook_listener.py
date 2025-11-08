@@ -153,13 +153,26 @@ def send_discord_alert(webhook_url, message, level="info"):
 
 # --- Fonctions Docker ---
 
-def run_docker_compose_command(command, compose_file):
-    """Exécute une commande docker compose"""
-    full_command = f"docker compose -f {compose_file} {command}"
-    logger.info(f"🐳 Exécution: {full_command}")
+# --- Fonctions Docker (VERSION FINALE ET SÉCURISÉE) ---
+
+def run_docker_compose_command(action, compose_file):
+    """
+    Exécute une commande docker compose sans shell=True (plus robuste et sécurisé).
+    action: string ("down" ou "up -d")
+    """
+    # Construction de la commande en liste, y compris la séparation de "up -d"
+    command_parts = ["docker-compose", "-f", compose_file] + action.split()
+
+    logger.info(f"🐳 Exécution sécurisée: {' '.join(command_parts)}")
+
     try:
+        # shell=True est retiré.
         result = subprocess.run(
-            full_command, shell=True, check=True, capture_output=True, text=True, timeout=120
+            command_parts,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120
         )
         logger.info(f"Commande réussie: {result.stdout.strip()}")
         return True
@@ -167,10 +180,14 @@ def run_docker_compose_command(command, compose_file):
         logger.error("Timeout lors de l'exécution Docker Compose")
         return False
     except subprocess.CalledProcessError as e:
-        logger.error(f"Erreur Docker Compose: {e.stderr.strip()}")
+        logger.error(f"Erreur Docker Compose (Code {e.returncode}): {e.stderr.strip()}")
+        logger.error("Vérifiez la permission du socket Docker (GID) ou le chemin du compose.")
+        return False
+    except FileNotFoundError as e:
+        logger.critical(f"Le binaire 'docker-compose' n'a pas été trouvé dans le PATH! {e}")
         return False
     except Exception as e:
-        logger.error(f"Erreur inconnue: {e}")
+        logger.error(f"Erreur inconnue lors de l'exécution de Docker Compose: {e}")
         return False
 
 def run_critical_recovery_script(service_name, attempt_count):
@@ -181,8 +198,7 @@ def run_critical_recovery_script(service_name, attempt_count):
             [RECOVERY_SCRIPT_PATH, service_name, str(attempt_count)],
             check=True, capture_output=True, text=True, timeout=60
         )
-        logger.info(f"Script de remédiation réussi:
-{result.stdout.strip()}")
+        logger.info(f"Script de remédiation réussi: {result.stdout.strip()}")
         return True
     except subprocess.TimeoutExpired:
         logger.error("Timeout du script de remédiation")
@@ -195,6 +211,11 @@ def run_critical_recovery_script(service_name, attempt_count):
 
 def verify_webhook_token():
     """Vérifie le token d'authentification du webhook"""
+    client_ip = request.remote_addr
+
+    # Faire confiance au réseau Docker interne
+    if client_ip.startswith('172.'):
+        return True
     if not WEBHOOK_SECRET:
         logger.warning("WEBHOOK_SECRET non défini, authentification désactivée (mode développement)")
         return True
@@ -220,6 +241,12 @@ def health_check():
 @app.route('/autoheal-event', methods=['POST'])
 def handle_autoheal_event():
     """Gère les événements de santé du service critique"""
+        # 🔍 AJOUTE CE DEBUG AU DÉBUT
+    logger.info(f"📥 Requête reçue depuis: {request.remote_addr}")
+    logger.info(f"📋 Headers complets: {dict(request.headers)}")
+    logger.info(f"📦 Body: {request.get_data(as_text=True)}")
+    logger.info(f"🔑 X-Webhook-Token trouvé: {request.headers.get('X-Webhook-Token')}")
+    logger.info(f"🔒 WEBHOOK_SECRET attendu: {WEBHOOK_SECRET[:10]}...")
     if not verify_webhook_token():
         logger.warning("Tentative d'accès non autorisée (token invalide/manquant)")
         return {"error": "Unauthorized"}, 401
@@ -227,15 +254,27 @@ def handle_autoheal_event():
     data = request.json
     if not data:
         return {"error": "Invalid JSON"}, 400
+    service_name = None
 
-    service_name = data.get('container_name')
-    event_type = data.get('type', 'restart_attempt')
+    # Format autoheal : {"content": "Container searchpy-app-dev (...) found..."}
+    if 'content' in data:
+        import re
+        match = re.search(r'Container (/?)([a-zA-Z0-9_-]+)', data['content'])
+        if match:
+            service_name = match.group(2)  # Extrait "searchpy-app-dev"
+            logger.info(f"🔍 Service extrait du content: {service_name}")
+
+    # Format custom : {"container_name": "...", "type": "..."}
+    if not service_name:
+        service_name = data.get('container_name')
+
+    if not service_name:
+        logger.warning("Aucun nom de service trouvé dans la requête")
+        return {"error": "No service name found"}, 400
 
     if not service_name or service_name != CRITICAL_SERVICE_NAME:
         return {"status": "ignored", "reason": "not_critical_service"}, 200
 
-    if event_type != 'restart_attempt':
-        return {"status": "ignored", "reason": "not_restart_event"}, 200
 
     if state_manager.is_in_cooldown(service_name):
         logger.info(f"Service {service_name} en cooldown, événement ignoré")
@@ -257,16 +296,6 @@ def handle_autoheal_event():
         )
         state_manager.mark_recovery_triggered(service_name)
 
-        if not run_critical_recovery_script(service_name, current_count):
-            send_discord_alert(
-                WEBHOOK_URL_FINAL,
-                f"**🚨 ÉCHEC CRITIQUE 🚨**\n\n"
-                f"**Service**: `{service_name}`\n"
-                f"**Problème**: Échec de la sauvegarde des logs\n"
-                f"**Action requise**: Intervention manuelle immédiate.",
-                level="FINAL_STOP"
-            )
-            return {"status": "error", "message": "Log backup failed"}, 500
 
         if run_docker_compose_command("down", COMPOSE_FILE_PATH):
             time.sleep(5)

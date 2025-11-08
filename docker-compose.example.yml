@@ -7,7 +7,7 @@
 services:
   # Redémarreur automatique avec support webhook
   autoheal:
-    image: monim1/autoheal:latest
+    image: willfarrell/autoheal:latest
     container_name: searchpy-autoheal
     restart: unless-stopped
     environment:
@@ -20,7 +20,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
-      - search_api_network
       - watchdog_internal
     depends_on:
       webhook-listener:
@@ -28,7 +27,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.25'
+          cpus: "0.25"
           memory: 128M
 
   # Cerveau de la remédiation critique
@@ -36,20 +35,18 @@ services:
   webhook-listener:
     # Remplacer 'votre-user' par votre nom d'utilisateur Docker Hub
     # ou 'ghcr.io/votre-user' pour GitHub Container Registry
-    image: votre-user/searchpy-webhook-listener:latest
+    # image: votre-user/searchpy-webhook-listener:latest
 
     # Alternative: utiliser un tag de version spécifique (RECOMMANDÉ en production)
     # image: votre-user/searchpy-webhook-listener:1.0.0
 
     # Pour développement local uniquement, décommenter build:
-    # build:
-    #   context: .
+    build:
+      context: .
     #   dockerfile: Dockerfile
 
     container_name: searchpy-webhook-listener
     restart: always
-    ports:
-      - "5000:5000"
     volumes:
       # Socket Docker pour contrôle de la stack
       - /var/run/docker.sock:/var/run/docker.sock
@@ -59,28 +56,27 @@ services:
       # SUPPRIMÉ: - ./critical_recovery.sh:/usr/src/app/critical_recovery.sh:ro
 
       # Dossier logs de l'application
-      - ./logs:/usr/src/app/logs_host
+      #- ./logs:/usr/src/app/logs_host
 
       # Répertoire de sauvegarde hôte
       - /var/backups/searchpy_logs:/usr/src/app/backups_mount
 
       # Fichier docker-compose de l'app (READ-ONLY)
-      - ./docker-compose.yml:/host/docker-compose.yml:ro
+      - ../searchPy/:/host/searchPy/:ro
 
       # Persistance de l'état (VOLUME NOMMÉ)
       - webhook_state:/usr/src/app/state
 
     environment:
-      CRITICAL_SERVICE_NAME: "searchpy-app-prod"
+      CRITICAL_SERVICE_NAME: "searchpy-app-dev"
       CRITICAL_FAIL_COUNT: 3
-      COMPOSE_FILE_PATH: "/host/docker-compose.yml"
+      COMPOSE_FILE_PATH: "/host/searchPy/docker-compose.yml"
       WEBHOOK_URL_CRITICAL: "${WEBHOOK_URL_CRITICAL}"
       WEBHOOK_URL_FINAL: "${WEBHOOK_URL_FINAL}"
       WEBHOOK_SECRET: "${WEBHOOK_SECRET}"
-      COOLDOWN_PERIOD: "300"
+      COOLDOWN_PERIOD: "2"
       HOSTNAME: "${HOSTNAME:-VPS-SEARCHPY-PROD}"
     networks:
-      - search_api_network
       - watchdog_internal
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -91,7 +87,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 256M
         reservations:
           memory: 128M
@@ -104,5 +100,3 @@ networks:
   watchdog_internal:
     name: searchpy_watchdog
     driver: bridge
-  search_api_network:
-    external: true

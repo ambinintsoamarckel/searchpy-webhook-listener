@@ -33,26 +33,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ========================================
 FROM base as runtime
 
-# Installation des outils système (minimaux)
+# Installation de Docker Compose v2 (standalone)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
-        docker.io \
         && \
+    # Télécharger Docker Compose v2
+    DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d'"' -f4) && \
+    curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose && \
+    chmod +x /usr/local/bin/docker-compose && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-# Création de l'utilisateur non-root
-RUN groupadd -r webhookuser && \
-    useradd -r -g webhookuser -u 1000 webhookuser
 
 # Création des répertoires nécessaires
 RUN mkdir -p \
     /usr/src/app/state \
     /usr/src/app/logs_host \
-    /usr/src/app/backups_mount \
-    && chown -R webhookuser:webhookuser /usr/src/app
+    /usr/src/app/backups_mount
 
 WORKDIR /usr/src/app
 
@@ -62,14 +60,14 @@ COPY --from=dependencies /usr/local/bin /usr/local/bin
 
 # Copier le code source
 # IMPORTANT: Le script critical_recovery.sh est maintenant DANS l'image
-COPY --chown=webhookuser:webhookuser src/webhook_listener.py .
-COPY --chown=webhookuser:webhookuser src/critical_recovery.sh .
+COPY src/webhook_listener.py .
+COPY src/critical_recovery.sh .
 
 # Rendre le script exécutable
 RUN chmod +x critical_recovery.sh
 
-# Changement vers l'utilisateur non-root
-USER webhookuser
+# ⚠️ EXÉCUTION EN ROOT pour accéder au socket Docker
+# (Pas de USER webhookuser ici)
 
 # Healthcheck intégré
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
