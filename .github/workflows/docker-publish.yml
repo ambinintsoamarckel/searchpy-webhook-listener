@@ -2,25 +2,25 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
     tags:
-      - 'v*.*.*'  # Déclenche sur les tags de version (v1.0.0, v1.2.3, etc.)
+      - "v*.*.*" # Déclenche sur les tags de version (v1.0.0, v1.2.3, etc.)
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # Permet de lancer manuellement
+    branches: [main]
+  workflow_dispatch: # Permet de lancer manuellement
 
 env:
   # Changer selon votre registry
-  REGISTRY: docker.io  # Pour Docker Hub
+  REGISTRY: docker.io # Pour Docker Hub
   # REGISTRY: ghcr.io  # Pour GitHub Container Registry
-  IMAGE_NAME: ${{ github.repository_owner }}/searchpy-webhook-listener
+  IMAGE_NAME: geomadagascar/searchpy-webhook-listener
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write  # Nécessaire pour ghcr.io
+      packages: write # Nécessaire pour ghcr.io
 
     steps:
       - name: 📥 Checkout repository
@@ -34,8 +34,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKER_USERNAME }}  # À configurer dans GitHub Secrets
-          password: ${{ secrets.DOCKER_PASSWORD }}  # À configurer dans GitHub Secrets
+          username: ${{ secrets.DOCKER_USERNAME }} # À configurer dans GitHub Secrets
+          password: ${{ secrets.DOCKER_PASSWORD }} # À configurer dans GitHub Secrets
 
       # Alternative pour GitHub Container Registry
       # - name: 🔐 Log in to GitHub Container Registry
@@ -68,11 +68,11 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64  # Support multi-architecture
+          platforms: linux/amd64,linux/arm64 # Support multi-architecture
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha  # Utilise le cache GitHub Actions
+          cache-from: type=gha # Utilise le cache GitHub Actions
           cache-to: type=gha,mode=max
 
       - name: 📊 Image digest
