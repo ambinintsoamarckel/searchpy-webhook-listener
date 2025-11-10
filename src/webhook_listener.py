@@ -8,6 +8,7 @@ import colorlog
 from flask import Flask, request
 from pathlib import Path
 import hmac
+import threading
 
 # --- Logger Setup ---
 def setup_logger():
@@ -41,7 +42,7 @@ WEBHOOK_URL_FINAL = os.environ.get("WEBHOOK_URL_FINAL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 STATE_FILE = "/usr/src/app/state/listener_state.json"
 RECOVERY_SCRIPT_PATH = "/usr/src/app/critical_recovery.sh"
-COOLDOWN_PERIOD = int(os.environ.get("COOLDOWN_PERIOD", 300))  # 5 min par défaut
+RESOLUTION_TIMEOUT = int(os.environ.get("RESOLUTION_TIMEOUT", 300))  # 5 min par défaut
 
 app = Flask(__name__)
 # Désactiver les logs de Flask pour ne garder que les nôtres
@@ -73,9 +74,11 @@ class StateManager:
                 logger.error(f"Erreur de lecture du fichier d'état: {e}, réinitialisation.")
         return {
             "fail_count": {},
-            "last_attempt_time": {},
-            "critical_recovery_triggered": {},
-            "recovery_history": []
+            "last_message_time": {},
+            "service_status": {},  # "NORMAL", "SURVEILLANCE_POST_RESTART", "PAUSED"
+            "paused_services": {},
+            "recovery_history": [],
+            "warning_sent": {}  # Pour savoir si on a déjà envoyé le warning initial
         }
 
     def save_state(self):
@@ -90,40 +93,96 @@ class StateManager:
         """Incrémente le compteur d'échecs"""
         current_count = self.state["fail_count"].get(service_name, 0) + 1
         self.state["fail_count"][service_name] = current_count
-        self.state["last_attempt_time"][service_name] = time.time()
+        self.state["last_message_time"][service_name] = time.time()
         self.save_state()
         return current_count
 
     def reset_fail_count(self, service_name):
         """Réinitialise le compteur"""
         self.state["fail_count"][service_name] = 0
-        self.state["critical_recovery_triggered"][service_name] = False
+        self.state["warning_sent"][service_name] = False
         self.save_state()
 
-    def is_in_cooldown(self, service_name):
-        """Vérifie si on est en période de cooldown"""
-        last_attempt = self.state["last_attempt_time"].get(service_name, 0)
-        return (time.time() - last_attempt) < COOLDOWN_PERIOD
+    def get_service_status(self, service_name):
+        """Retourne le statut du service"""
+        return self.state["service_status"].get(service_name, "NORMAL")
 
-    def mark_recovery_triggered(self, service_name):
-        """Marque qu'une remédiation critique a été déclenchée"""
-        self.state["critical_recovery_triggered"][service_name] = True
+    def set_service_status(self, service_name, status):
+        """Change le statut du service"""
+        self.state["service_status"][service_name] = status
+        self.save_state()
+        logger.info(f"📊 Service {service_name} → Statut: {status}")
+
+    def pause_service(self, service_name, reason):
+        """Met le service en pause"""
+        self.state["paused_services"][service_name] = {
+            "paused_at": time.time(),
+            "reason": reason,
+            "last_message_time": time.time()
+        }
+        self.set_service_status(service_name, "PAUSED")
+        logger.warning(f"⏸️ Service {service_name} mis en PAUSE: {reason}")
+
+    def unpause_service(self, service_name):
+        """Retire le service de la pause"""
+        if service_name in self.state["paused_services"]:
+            del self.state["paused_services"][service_name]
+        self.set_service_status(service_name, "NORMAL")
+        self.reset_fail_count(service_name)
+        logger.info(f"▶️ Service {service_name} retiré de la pause")
+
+    def is_paused(self, service_name):
+        """Vérifie si le service est en pause"""
+        return service_name in self.state["paused_services"]
+
+    def update_last_message_time(self, service_name):
+        """Met à jour le timestamp du dernier message"""
+        self.state["last_message_time"][service_name] = time.time()
+        if service_name in self.state["paused_services"]:
+            self.state["paused_services"][service_name]["last_message_time"] = time.time()
+        self.save_state()
+
+    def get_time_since_last_message(self, service_name):
+        """Retourne le temps écoulé depuis le dernier message"""
+        last_time = self.state["last_message_time"].get(service_name, 0)
+        return time.time() - last_time
+
+    def has_warning_been_sent(self, service_name):
+        """Vérifie si le warning initial a été envoyé"""
+        return self.state["warning_sent"].get(service_name, False)
+
+    def mark_warning_sent(self, service_name):
+        """Marque le warning comme envoyé"""
+        self.state["warning_sent"][service_name] = True
+        self.save_state()
+
+    def add_recovery_event(self, service_name, event_type, details):
+        """Ajoute un événement dans l'historique"""
         self.state["recovery_history"].append({
             "service": service_name,
             "timestamp": time.time(),
-            "fail_count": self.state["fail_count"].get(service_name, 0)
+            "event": event_type,
+            "details": details
         })
         self.save_state()
-
-    def is_recovery_triggered(self, service_name):
-        """Vérifie si une remédiation est en cours"""
-        return self.state["critical_recovery_triggered"].get(service_name, False)
 
 state_manager = StateManager(STATE_FILE)
 
 # --- Constantes d'Alerte ---
-COLORS = {"info": 3447003, "warning": 16776960, "critical": 15158332, "FINAL_STOP": 15158332}
-EMOJIS = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨", "FINAL_STOP": "🔴"}
+COLORS = {
+    "info": 3447003,
+    "warning": 16776960,
+    "critical": 15158332,
+    "success": 5763719,
+    "FINAL_STOP": 15158332
+}
+EMOJIS = {
+    "info": "ℹ️",
+    "warning": "⚠️",
+    "critical": "🚨",
+    "success": "✅",
+    "FINAL_STOP": "🔴"
+}
 
 # --- Fonctions d'Alerte ---
 
@@ -153,20 +212,15 @@ def send_discord_alert(webhook_url, message, level="info"):
 
 # --- Fonctions Docker ---
 
-# --- Fonctions Docker (VERSION FINALE ET SÉCURISÉE) ---
-
 def run_docker_compose_command(action, compose_file):
     """
     Exécute une commande docker compose sans shell=True (plus robuste et sécurisé).
     action: string ("down" ou "up -d")
     """
-    # Construction de la commande en liste, y compris la séparation de "up -d"
     command_parts = ["docker-compose", "-f", compose_file] + action.split()
-
     logger.info(f"🐳 Exécution sécurisée: {' '.join(command_parts)}")
 
     try:
-        # shell=True est retiré.
         result = subprocess.run(
             command_parts,
             check=True,
@@ -190,22 +244,102 @@ def run_docker_compose_command(action, compose_file):
         logger.error(f"Erreur inconnue lors de l'exécution de Docker Compose: {e}")
         return False
 
-def run_critical_recovery_script(service_name, attempt_count):
-    """Exécute le script de sauvegarde des logs"""
-    logger.info(f"📦 Exécution du script de remédiation: {RECOVERY_SCRIPT_PATH}")
-    try:
-        result = subprocess.run(
-            [RECOVERY_SCRIPT_PATH, service_name, str(attempt_count)],
-            check=True, capture_output=True, text=True, timeout=60
+def perform_recovery(service_name, fail_count):
+    """Lance la procédure de récupération complète"""
+    logger.warning(f"🔧 Début de la procédure de récupération pour {service_name}")
+    # Tentative de redémarrage
+    if not run_docker_compose_command("down", COMPOSE_FILE_PATH):
+        logger.critical(f"❌ Échec de 'docker-compose down'")
+        state_manager.pause_service(service_name, "docker_down_failed")
+        state_manager.add_recovery_event(service_name, "recovery_failed", "docker-compose down failed")
+
+        send_discord_alert(
+            WEBHOOK_URL_FINAL,
+            f"**🔴 ÉCHEC COMMANDE DOCKER - INTERVENTION REQUISE 🔴**\n\n"
+            f"**Service**: `{service_name}`\n"
+            f"**Problème**: La commande `docker-compose down` a échoué\n"
+            f"**Action**: Service mis en PAUSE - Écoute arrêtée\n\n"
+            f"@everyone - Intervention manuelle nécessaire",
+            level="FINAL_STOP"
         )
-        logger.info(f"Script de remédiation réussi: {result.stdout.strip()}")
-        return True
-    except subprocess.TimeoutExpired:
-        logger.error("Timeout du script de remédiation")
         return False
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Erreur script: {e.stderr.strip()}")
+
+    time.sleep(5)
+
+    if not run_docker_compose_command("up -d", COMPOSE_FILE_PATH):
+        logger.critical(f"❌ Échec de 'docker-compose up -d'")
+        state_manager.pause_service(service_name, "docker_up_failed")
+        state_manager.add_recovery_event(service_name, "recovery_failed", "docker-compose up failed")
+
+        send_discord_alert(
+            WEBHOOK_URL_FINAL,
+            f"**🔴 ÉCHEC COMMANDE DOCKER - INTERVENTION REQUISE 🔴**\n\n"
+            f"**Service**: `{service_name}`\n"
+            f"**Problème**: La commande `docker-compose up -d` a échoué\n"
+            f"**Action**: Service mis en PAUSE - Écoute arrêtée\n\n"
+            f"@everyone - Intervention manuelle nécessaire",
+            level="FINAL_STOP"
+        )
         return False
+
+    # Redémarrage réussi, passage en mode surveillance
+    logger.info(f"✅ Redémarrage Docker réussi, passage en mode SURVEILLANCE")
+    state_manager.set_service_status(service_name, "SURVEILLANCE_POST_RESTART")
+    state_manager.add_recovery_event(service_name, "recovery_started", f"docker restarted, fail_count={fail_count}")
+
+    return True
+
+# --- Thread de surveillance ---
+
+def monitor_paused_services():
+    """Vérifie périodiquement si les services en pause peuvent être réactivés"""
+    while True:
+        time.sleep(30)  # Vérification toutes les 30 secondes
+
+        for service_name in list(state_manager.state["paused_services"].keys()):
+            time_since_last = state_manager.get_time_since_last_message(service_name)
+
+            if time_since_last >= RESOLUTION_TIMEOUT:
+                logger.info(f"✅ Service {service_name}: Pas de message depuis {RESOLUTION_TIMEOUT}s, considéré comme résolu")
+
+                state_manager.add_recovery_event(service_name, "resolved_manually", f"no messages for {RESOLUTION_TIMEOUT}s")
+                state_manager.unpause_service(service_name)
+
+                send_discord_alert(
+                    WEBHOOK_URL_CRITICAL,
+                    f"**✅ SERVICE RÉTABLI (Intervention manuelle)**\n\n"
+                    f"**Service**: `{service_name}`\n"
+                    f"**Résolution**: Aucun échec détecté depuis {RESOLUTION_TIMEOUT//60} minutes\n"
+                    f"**Action**: Compteur réinitialisé - Surveillance normale reprise\n\n"
+                    f"Le service est maintenant stable.",
+                    level="success"
+                )
+
+        # Vérifier aussi les services en surveillance post-restart
+        for service_name, status in list(state_manager.state["service_status"].items()):
+            if status == "SURVEILLANCE_POST_RESTART":
+                time_since_last = state_manager.get_time_since_last_message(service_name)
+
+                if time_since_last >= RESOLUTION_TIMEOUT:
+                    logger.info(f"✅ Service {service_name}: Stable après redémarrage, considéré comme résolu")
+
+                    state_manager.add_recovery_event(service_name, "resolved_automatically", f"stable for {RESOLUTION_TIMEOUT}s after restart")
+                    state_manager.set_service_status(service_name, "NORMAL")
+                    state_manager.reset_fail_count(service_name)
+
+                    send_discord_alert(
+                        WEBHOOK_URL_CRITICAL,
+                        f"**✅ SERVICE RÉTABLI AUTOMATIQUEMENT**\n\n"
+                        f"**Service**: `{service_name}`\n"
+                        f"**Résolution**: Aucun échec détecté depuis {RESOLUTION_TIMEOUT//60} minutes après redémarrage\n"
+                        f"**Action**: Compteur réinitialisé - Surveillance normale reprise\n\n"
+                        f"La réparation automatique a réussi.",
+                        level="success"
+                    )
+
+# Démarrer le thread de surveillance
+monitor_thread = threading.Thread(target=monitor_paused_services, daemon=True)
+monitor_thread.start()
 
 # --- Authentification ---
 
@@ -241,12 +375,8 @@ def health_check():
 @app.route('/autoheal-event', methods=['POST'])
 def handle_autoheal_event():
     """Gère les événements de santé du service critique"""
-        # 🔍 AJOUTE CE DEBUG AU DÉBUT
     logger.info(f"📥 Requête reçue depuis: {request.remote_addr}")
-    logger.info(f"📋 Headers complets: {dict(request.headers)}")
-    logger.info(f"📦 Body: {request.get_data(as_text=True)}")
-    logger.info(f"🔑 X-Webhook-Token trouvé: {request.headers.get('X-Webhook-Token')}")
-    logger.info(f"🔒 WEBHOOK_SECRET attendu: {WEBHOOK_SECRET[:10]}...")
+
     if not verify_webhook_token():
         logger.warning("Tentative d'accès non autorisée (token invalide/manquant)")
         return {"error": "Unauthorized"}, 401
@@ -254,6 +384,7 @@ def handle_autoheal_event():
     data = request.json
     if not data:
         return {"error": "Invalid JSON"}, 400
+
     service_name = None
 
     # Format autoheal : {"content": "Container searchpy-app-dev (...) found..."}
@@ -261,7 +392,7 @@ def handle_autoheal_event():
         import re
         match = re.search(r'Container (/?)([a-zA-Z0-9_-]+)', data['content'])
         if match:
-            service_name = match.group(2)  # Extrait "searchpy-app-dev"
+            service_name = match.group(2)
             logger.info(f"🔍 Service extrait du content: {service_name}")
 
     # Format custom : {"container_name": "...", "type": "..."}
@@ -272,48 +403,76 @@ def handle_autoheal_event():
         logger.warning("Aucun nom de service trouvé dans la requête")
         return {"error": "No service name found"}, 400
 
-    if not service_name or service_name != CRITICAL_SERVICE_NAME:
+    if service_name != CRITICAL_SERVICE_NAME:
         return {"status": "ignored", "reason": "not_critical_service"}, 200
 
+    # Mettre à jour le timestamp du dernier message
+    state_manager.update_last_message_time(service_name)
 
-    if state_manager.is_in_cooldown(service_name):
-        logger.info(f"Service {service_name} en cooldown, événement ignoré")
-        return {"status": "cooldown"}, 200
+    # Vérifier si le service est en pause
+    if state_manager.is_paused(service_name):
+        logger.info(f"⏸️ Service {service_name} en PAUSE, événement ignoré silencieusement")
+        return {"status": "paused"}, 200
 
+    # Vérifier si on est en surveillance post-restart
+    if state_manager.get_service_status(service_name) == "SURVEILLANCE_POST_RESTART":
+        logger.warning(f"❌ Service {service_name} toujours unhealthy après redémarrage!")
+
+        state_manager.pause_service(service_name, "still_unhealthy_after_restart")
+        state_manager.add_recovery_event(service_name, "recovery_failed", "still unhealthy after restart")
+
+        send_discord_alert(
+            WEBHOOK_URL_FINAL,
+            f"**🔴 ÉCHEC DE LA RÉPARATION AUTOMATIQUE**\n\n"
+            f"**Service**: `{service_name}`\n"
+            f"**Problème**: Le service est toujours unhealthy après redémarrage complet\n"
+            f"**Action**: Service mis en PAUSE - Écoute arrêtée\n\n"
+            f"@everyone - **INTERVENTION MANUELLE REQUISE**",
+            level="FINAL_STOP"
+        )
+
+        return {"status": "paused_after_failed_recovery"}, 200
+
+    # Incrémenter le compteur
     current_count = state_manager.increment_fail_count(service_name)
     logger.info(f"Échec détecté pour '{service_name}'. Total: {current_count}/{CRITICAL_FAIL_COUNT}")
 
-    if current_count >= CRITICAL_FAIL_COUNT and not state_manager.is_recovery_triggered(service_name):
-        logger.warning(f"Seuil critique atteint pour '{service_name}'. Démarrage de la remédiation.")
+    # Premier échec : envoyer le warning
+    if current_count == 1 and not state_manager.has_warning_been_sent(service_name):
+        state_manager.mark_warning_sent(service_name)
         send_discord_alert(
             WEBHOOK_URL_CRITICAL,
+            f"**⚠️ SERVICE UNHEALTHY DÉTECTÉ**\n\n"
             f"**Service**: `{service_name}`\n"
-            f"**Échecs consécutifs**: {current_count}\n"
-            f"**Action**: Démarrage de la remédiation critique\n"
-            f"- Sauvegarde des logs\n"
-            f"- Redémarrage complet de la stack",
+            f"**Statut**: Unhealthy (1/{CRITICAL_FAIL_COUNT})\n"
+            f"**Action**: Surveillance en cours\n\n"
+            f"Si {CRITICAL_FAIL_COUNT} échecs consécutifs sont détectés, "
+            f"une réparation automatique sera lancée (`docker-compose down/up`).",
+            level="warning"
+        )
+
+    # Seuil critique atteint
+    if current_count >= CRITICAL_FAIL_COUNT:
+        logger.warning(f"🚨 Seuil critique atteint pour '{service_name}'. Démarrage de la remédiation.")
+
+        send_discord_alert(
+            WEBHOOK_URL_CRITICAL,
+            f"**🚨 SEUIL CRITIQUE ATTEINT**\n\n"
+            f"**Service**: `{service_name}`\n"
+            f"**Échecs consécutifs**: {current_count}/{CRITICAL_FAIL_COUNT}\n"
+            f"**Action**: Lancement de la réparation automatique\n\n"
+            f"📋 Étapes:\n"
+            f"1. `docker-compose down`\n"
+            f"2. `docker-compose up -d`\n"
+            f"3. Surveillance pendant {RESOLUTION_TIMEOUT//60} minutes",
             level="critical"
         )
-        state_manager.mark_recovery_triggered(service_name)
 
-
-        if run_docker_compose_command("down", COMPOSE_FILE_PATH):
-            time.sleep(5)
-            if run_docker_compose_command("up -d", COMPOSE_FILE_PATH):
-                logger.info("Stack relancée avec succès, attente du prochain healthcheck.")
-                state_manager.reset_fail_count(service_name)
-                return {"status": "recovery_success"}, 200
-
-        logger.critical(f"La remédiation automatique a échoué pour '{service_name}'. Intervention manuelle requise.")
-        send_discord_alert(
-            WEBHOOK_URL_FINAL,
-            f"**🔴 ARRÊT FINAL - INTERVENTION REQUISE 🔴**\n\n"
-            f"**Service**: `{service_name}`\n"
-            f"**Problème**: La remédiation automatique (docker compose down/up) a échoué.\n\n"
-            f"@everyone - Panne critique détectée",
-            level="FINAL_STOP"
-        )
-        return {"status": "error", "message": "Full recovery failed"}, 500
+        # Lancer la récupération
+        if perform_recovery(service_name, current_count):
+            return {"status": "recovery_initiated", "next_state": "surveillance"}, 200
+        else:
+            return {"status": "recovery_failed", "service_paused": True}, 500
 
     return {"status": "counted", "current": current_count, "threshold": CRITICAL_FAIL_COUNT}, 200
 
@@ -325,7 +484,14 @@ def reset_state():
         return {"error": "Unauthorized"}, 401
 
     service_name = request.json.get('service_name', CRITICAL_SERVICE_NAME)
-    state_manager.reset_fail_count(service_name)
+
+    # Retirer de la pause si nécessaire
+    if state_manager.is_paused(service_name):
+        state_manager.unpause_service(service_name)
+    else:
+        state_manager.reset_fail_count(service_name)
+        state_manager.set_service_status(service_name, "NORMAL")
+
     logger.info(f"État réinitialisé manuellement pour le service '{service_name}'")
     return {"status": "reset", "service": service_name}, 200
 
@@ -336,13 +502,14 @@ def get_status():
         "state": state_manager.state,
         "critical_service": CRITICAL_SERVICE_NAME,
         "threshold": CRITICAL_FAIL_COUNT,
-        "cooldown_period": COOLDOWN_PERIOD
+        "resolution_timeout": RESOLUTION_TIMEOUT
     }, 200
 
 if __name__ == '__main__':
-    logger.info("🚀 Démarrage du Webhook Listener Sécurisé")
+    logger.info("🚀 Démarrage du Webhook Listener Amélioré v2")
     logger.info(f"Service critique à surveiller: {CRITICAL_SERVICE_NAME}")
     logger.info(f"Seuil d'échecs avant action: {CRITICAL_FAIL_COUNT}")
-    logger.info(f"Période de cooldown: {COOLDOWN_PERIOD}s")
+    logger.info(f"Délai de résolution: {RESOLUTION_TIMEOUT}s ({RESOLUTION_TIMEOUT//60} min)")
     logger.info(f"Authentification: {'Activée' if WEBHOOK_SECRET else 'DÉSACTIVÉE (MODE DÉVELOPPEMENT)'}")
+    logger.info(f"Thread de surveillance: Démarré")
     app.run(host='0.0.0.0', port=5000)
