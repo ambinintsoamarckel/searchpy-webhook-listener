@@ -6,10 +6,10 @@
 FROM python:3.11-slim as base
 
 # Métadonnées
-LABEL maintainer="votre-email@example.com"
-LABEL org.opencontainers.image.source="https://github.com/votre-user/searchpy-webhook-listener"
+LABEL maintainer="marsonambinintsoa@gmail.com"
+LABEL org.opencontainers.image.source="https://github.com/ambinintsoamarckel/searchpy-webhook-listener/"
 LABEL org.opencontainers.image.description="Intelligent auto-healing webhook listener for Docker containers"
-LABEL org.opencontainers.image.licenses="MIT"
+
 
 # Variables d'environnement
 ENV PYTHONUNBUFFERED=1 \
@@ -48,9 +48,8 @@ RUN apt-get update && \
 
 # Création des répertoires nécessaires
 RUN mkdir -p \
-    /usr/src/app/state \
-    /usr/src/app/logs_host \
-    /usr/src/app/backups_mount
+    /usr/src/app/state
+
 
 WORKDIR /usr/src/app
 
@@ -59,12 +58,7 @@ COPY --from=dependencies /usr/local/lib/python3.11/site-packages /usr/local/lib/
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 
 # Copier le code source
-# IMPORTANT: Le script critical_recovery.sh est maintenant DANS l'image
 COPY src/webhook_listener.py .
-COPY src/critical_recovery.sh .
-
-# Rendre le script exécutable
-RUN chmod +x critical_recovery.sh
 
 # ⚠️ EXÉCUTION EN ROOT pour accéder au socket Docker
 # (Pas de USER webhookuser ici)
